@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+"""Video-output handoff using the existing Tailscale SSH host x-windows."""
+import argparse
+import base64
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import uuid
+
+HOME_DIR = Path.home()
+SUPPORT = HOME_DIR / 'Library/Application Support/MonitorSwitch'
+PROFILE = SUPPORT / 'bin/display-profile'
+DDC = SUPPORT / 'bin/m1ddc'
+
+def preserve_video_on_input_failure(action, request, state):
+    """An input failure must not undo the user's Windows video selection."""
+    return (action == 'mac' and request.get('target') == 'windows'
+            and state.get('command', '').lower() == request.get('id', '').lower()
+            and state.get('mode') == 'mac' and bool(state.get('error')))
+
+def run(args, timeout=20):
+    result = subprocess.run([str(x) for x in args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or 'Command failed')
+    return result.stdout.lstrip('\ufeff').strip()
+
+def remote(action):
+    request = {'id': str(uuid.uuid4()), 'action': action}
+    payload = base64.b64encode(json.dumps(request).encode('utf-8')).decode('ascii')
+    script = r'''
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.Encoding]::UTF8
+$root=Join-Path $env:LOCALAPPDATA 'MonitorSwitch'
+$request=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
+$temporary=Join-Path $root ('video-request-'+$request.id+'.tmp')
+$request | ConvertTo-Json | Set-Content $temporary -Encoding UTF8
+Move-Item $temporary (Join-Path $root 'video-request.json') -Force
+Start-ScheduledTask -TaskName 'MonitorSwitch-VideoCommand'
+$deadline=(Get-Date).AddSeconds(25)
+do {
+  Start-Sleep -Milliseconds 150
+  $file=Join-Path $root 'video-result.json'
+  if(Test-Path $file) {
+    try {$result=Get-Content $file -Raw | ConvertFrom-Json} catch {continue}
+    if($result.id -eq $request.id) {$result | ConvertTo-Json -Depth 5 -Compress;exit 0}
+  }
+} while((Get-Date) -lt $deadline)
+throw 'Timed out waiting for the interactive video task.'
+'''.replace('__PAYLOAD__', payload)
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    result = json.loads(run(['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+                             'x-windows', 'powershell -NoProfile -EncodedCommand ' + encoded], 35))
+    if not result.get('success'):
+        raise RuntimeError(result.get('error', 'Windows video task failed'))
+    expected = {'detach': False, 'restore': True}.get(action)
+    if expected is not None and result.get('state', {}).get('attached') is not expected:
+        raise RuntimeError('Windows did not confirm the expected output state')
+    return result
+
+def main():
+    parser = argparse.ArgumentParser(description='通过 Tailscale 停用 Windows DP，再恢复 Mac HDMI。')
+    parser.add_argument('action', nargs='?', default='mac', choices=['mac', 'windows', 'restore-dp', 'status'])
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--request-id', type=uuid.UUID, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.dry_run:
+        print('mac: 暂停 Mac 外接输出 → Windows 停用 LECOO DP → Mac 恢复 HDMI 主屏幕。')
+        print('windows: 启用 Windows DP → 从 Mac 发送 DP 15 → 停用 Mac 外接输出。')
+        print('restore-dp: 重新启用 Windows LECOO DP；status: 只查询两端软件输出状态。')
+        return
+    SUPPORT.mkdir(parents=True, exist_ok=True)
+    with (SUPPORT / 'video-handoff.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        request_id = str(args.request_id) if args.request_id else str(uuid.uuid4())
+        if args.request_id:
+            current = json.loads((SUPPORT / 'selective-input-command.json').read_text())
+            if current.get('id', '').lower() != request_id.lower():
+                print('忽略已被更新操作替代的显示请求。')
+                return
+            if args.action == 'mac' and current.get('target') == 'windows':
+                # Installed older routers launch this command just before
+                # publishing their stop reason. Wait for that reason first.
+                state = {}
+                for _ in range(60):
+                    try:
+                        state = json.loads((SUPPORT / 'selective-input-state.json').read_text())
+                    except (OSError, json.JSONDecodeError):
+                        state = {}
+                    if state.get('command', '').lower() == request_id.lower() and state.get('mode') == 'mac':
+                        break
+                    time.sleep(0.05)
+                try:
+                    pid = int(state.get('pid', 0))
+                    alive = pid > 0
+                    if alive:
+                        os.kill(pid, 0)
+                except (OSError, ValueError, TypeError):
+                    alive = False
+                latest = json.loads((SUPPORT / 'selective-input-command.json').read_text())
+                if latest.get('id', '').lower() != request_id.lower():
+                    print('忽略已被更新操作替代的显示请求。')
+                    return
+                if preserve_video_on_input_failure(args.action, current, state) or not alive or state.get('mode') != 'mac':
+                    print('输入断线或后台停止：保留当前视频布局，不重新启用 Mac 外接桌面。')
+                    return
+        result_file = SUPPORT / 'last-video-handoff.json'
+        if args.request_id and result_file.exists():
+            previous = json.loads(result_file.read_text())
+            if previous.get('success') and previous.get('requestId', '').lower() == request_id.lower() and previous.get('target') == args.action:
+                print('同一显示请求已完成。')
+                return
+        if args.action == 'status':
+            print(json.dumps({'windows': remote('inspect'), 'mac': json.loads(run([PROFILE, 'status']))}, ensure_ascii=False, indent=2))
+            return
+        if args.action == 'restore-dp':
+            print(json.dumps(remote('restore'), ensure_ascii=False, indent=2))
+            print('Windows 的 LECOO DP 输出已恢复。')
+            return
+        if args.action == 'windows':
+            before_windows = remote('inspect')
+            result_file.write_text(json.dumps({'success': False, 'inProgress': True, 'requestId': request_id, 'target': 'windows'}))
+            try:
+                print('1/3 准备 Mac 显示控制通道…', flush=True)
+                run([PROFILE, 'mac'])
+                print('2/3 启用 Windows LECOO DP 输出…', flush=True)
+                windows = remote('restore')
+                config = json.loads((SUPPORT / 'config.json').read_text())
+                print('3/3 发送 DP 15，再停用 Mac 外接显示输出…', flush=True)
+                run([DDC, 'display', config['displayID'], 'set', 'input', str(config['windowsInput'])])
+                mac = json.loads(run([PROFILE, 'windows']))
+                result_file.write_text(json.dumps({'success': True, 'requestId': request_id, 'target': 'windows', 'windows': windows, 'mac': mac}, ensure_ascii=False, indent=2))
+                print('Windows DP 已启用，Mac 外接输出已停用。')
+            except (Exception, KeyboardInterrupt) as error:
+                result_file.write_text(json.dumps({'success': False, 'requestId': request_id, 'target': 'windows', 'error': str(error)}, ensure_ascii=False, indent=2))
+                try:
+                    run([PROFILE, 'mac'])
+                    if not before_windows['state']['attached']:
+                        remote('detach')
+                        run([PROFILE, 'windows'])
+                        run([PROFILE, 'mac'])
+                except Exception as recovery_error:
+                    print('自动恢复未完成：' + str(recovery_error), file=sys.stderr)
+                raise
+            return
+        print('检查：连接 X 主机并读取 DP 输出状态。', flush=True)
+        try:
+            before_windows = remote('inspect')
+        except Exception as error:
+            try:
+                run([PROFILE, 'mac'])
+                print('Windows 无法确认，已先恢复 Mac HDMI 输出。', file=sys.stderr)
+            except Exception as local_error:
+                print('Mac 输出恢复未完成：' + str(local_error), file=sys.stderr)
+            result_file.write_text(json.dumps({'success': False, 'requestId': request_id, 'target': 'mac', 'error': str(error)}, ensure_ascii=False, indent=2))
+            raise
+        restore_on_error = before_windows['state']['attached']
+        result_file.write_text(json.dumps({'success': False, 'inProgress': True, 'requestId': request_id, 'target': 'mac'}))
+        print('准备：Mac 暂时仅使用内置屏幕。', flush=True)
+        detach_requested = False
+        try:
+            run([PROFILE, 'windows'])
+            print('1/2 通过 Tailscale 停用 X 主机的 LECOO DP 输出…', flush=True)
+            detach_requested = True
+            windows = remote('detach')
+            print('2/2 恢复 Mac HDMI 显示输出并设为主屏幕…', flush=True)
+            mac = json.loads(run([PROFILE, 'mac']))
+            result = {'success': True, 'requestId': request_id, 'target': 'mac', 'windows': windows, 'mac': mac}
+            result_file.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+            print('已确认：Windows DP 输出停用；Mac HDMI 输出启用。')
+            print('显示器是否已显示 Mac，仍以实际画面为准。恢复 Windows DP：display-handoff restore-dp')
+        except (Exception, KeyboardInterrupt) as error:
+            result_file.write_text(json.dumps({'success': False, 'requestId': request_id, 'target': args.action, 'error': str(error)}, ensure_ascii=False, indent=2))
+            try:
+                run([PROFILE, 'mac'])
+                if detach_requested and restore_on_error:
+                    remote('restore')
+                    print('操作中止，已恢复 Windows DP 输出。', file=sys.stderr)
+            except Exception as recovery_error:
+                print('自动恢复未完成：' + str(recovery_error), file=sys.stderr)
+            raise
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as error:
+        print('失败：' + str(error), file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,111 @@
+diff --git a/headers/i2c.h b/headers/i2c.h
+index 8f57e7c..e7ae934 100644
+--- a/headers/i2c.h
++++ b/headers/i2c.h
+@@ -21,7 +21,7 @@
+ # define KVM		0xE7
+ # define ASUS_KVM	0xF3
+ 
+-# define DDC_WAIT			10000	// Depending on display this must be set to as high as 50000
++# define DDC_WAIT			50000	// Allow slow monitor/adapter replies.
+ # define DDC_ITERATIONS		2		// Depending on display this must be set higher
+ # define DDC_MCDP_READ_WAIT	50000	// 10 ms returned empty MCDP29xx replies in testing
+ # define DDC_BUFFER_SIZE	256
+@@ -40,7 +40,7 @@ typedef struct {
+ 
+ DDCPacket	createDDCPacket(UInt8 attrCode);
+ 
+-void		prepareDDCRead(UInt8 *data);
++void		prepareDDCRead(DDCPacket *packet);
+ void		prepareDDCWrite(DDCPacket *packet, UInt16 setValue);
+ 
+ IOReturn	performDDCWrite(IOAVServiceRef avService, DDCPacket *packet);
+diff --git a/sources/i2c.m b/sources/i2c.m
+index 08d7303..0e61e6e 100644
+--- a/sources/i2c.m
++++ b/sources/i2c.m
+@@ -4,14 +4,8 @@
+ #include "utils.h"
+ 
+ static int getBytesUsed(UInt8* data) {
+-    int bytes = 0;
+-    // Check up to DDC_BUFFER_SIZE bytes, not sizeof(data) which is just pointer size
+-    for (int i = 0; i < DDC_BUFFER_SIZE; ++i) {
+-        if (data[i] != 0) {
+-            bytes = i + 1;
+-        }
+-    }
+-    return bytes;
++    // Length byte + payload + checksum, including a possible zero checksum.
++    return (data[0] & 0x7f) + 2;
+ }
+ 
+ // Function to get ready for DDC operations for a specific display attribute
+@@ -23,10 +17,11 @@ DDCPacket createDDCPacket(UInt8 attrCode) {
+ }
+ 
+ // Prepare DDC packet for read
+-void prepareDDCRead(UInt8* data) {
++void prepareDDCRead(DDCPacket *packet) {
++    UInt8 *data = packet->data;
+     data[0] = 0x82;
+     data[1] = 0x01;
+-    data[3] = 0x6e ^ data[0] ^ data[1] ^ data[2] ^ data[3];
++    data[3] = 0x6e ^ packet->inputAddr ^ data[0] ^ data[1] ^ data[2];
+ }
+ 
+ // Prepare DDC packet for write
+@@ -68,19 +63,14 @@ IOReturn performDDCWrite(IOAVServiceRef avService, DDCPacket *packet) {
+ 
+ 
+ DDCValue convertI2CtoDDC(char *i2cBytes) {
+-    DDCValue displayAttr = {};
+-    NSData *i2cData = [NSData dataWithBytes:(const void *)i2cBytes length:(NSUInteger)11];
+-    // DDC/CI "Get VCP Feature Reply": maximum value is in bytes [6..7] and the
+-    // current value in bytes [8..9], both big-endian.
+-    NSRange maxValueRange = {6, 2};
+-    uint16_t maxValue = 0;
+-    [[i2cData subdataWithRange:maxValueRange] getBytes:&maxValue length:sizeof(2)];
+-    displayAttr.maxValue = CFSwapInt16BigToHost(maxValue);
+-
+-    NSRange curValueRange = {8, 2};
+-    uint16_t curValue = 0;
+-    [[i2cData subdataWithRange:curValueRange] getBytes:&curValue length:sizeof(2)];
+-    displayAttr.curValue = CFSwapInt16BigToHost(curValue);
+-
+-    return displayAttr;
++    const UInt8 *data = (const UInt8 *)i2cBytes;
++    UInt8 checksum = 0x50;
++    for (int i = 0; i < 11; ++i) checksum ^= data[i];
++    if (data[0] != 0x6e || data[1] != 0x88 || data[2] != 0x02 || data[3] != 0 || checksum != 0) {
++        fprintf(stderr, "Invalid DDC reply:");
++        for (int i = 0; i < 11; ++i) fprintf(stderr, " %02x", data[i]);
++        fprintf(stderr, "\n");
++        return (DDCValue){-1, -1};
++    }
++    return (DDCValue){(data[8] << 8) | data[9], (data[6] << 8) | data[7]};
+ }
+diff --git a/sources/m1ddc.m b/sources/m1ddc.m
+index 4b30fa7..0c98f1e 100644
+--- a/sources/m1ddc.m
++++ b/sources/m1ddc.m
+@@ -105,7 +105,7 @@ static void printDisplayInfos(DisplayInfos *display, int nbDisplays, bool detail
+ static DDCValue readingOperation(DDCTransport *transport, DDCPacket *packet) {
+     DDCValue dummyAttr = {-1, -1};
+ 
+-    prepareDDCRead(packet->data);
++    prepareDDCRead(packet);
+ 
+     IOReturn err = performDDCWriteAtChipAddress(transport->service, transport->chipAddress, packet);
+     if (err) {
+@@ -122,6 +122,10 @@ static DDCValue readingOperation(DDCTransport *transport, DDCPacket *packet) {
+         return dummyAttr;
+     }
+ 
++    if (readPacket.data[4] != packet->data[2]) {
++        fprintf(stderr, "DDC reply did not echo the requested VCP code.\n");
++        return dummyAttr;
++    }
+     return convertI2CtoDDC((char *)readPacket.data);
+ }
+ 
